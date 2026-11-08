@@ -2,6 +2,8 @@ import os, re, sqlite3
 from functools import wraps
 from urllib.parse import quote
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, flash, redirect, render_template, request, session, url_for, abort
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +51,54 @@ def admin(fn):
 def slugify(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48] or "local-shop"
 
+# Retry temporary network failures and use alternate Overpass map servers.
+HTTP = requests.Session()
+_retry = Retry(
+    total=2, connect=2, read=1, status=2, backoff_factor=0.8,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    respect_retry_after_header=True,
+)
+_adapter = HTTPAdapter(max_retries=_retry)
+HTTP.mount("https://", _adapter)
+HTTP.mount("http://", _adapter)
+
+OVERPASS_SERVERS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+
+def find_coordinates(area):
+    response = HTTP.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": area, "format": "jsonv2", "limit": 1},
+        headers={"User-Agent": "AutoForgeAI/0.2 (business discovery app)"},
+        timeout=(8, 25),
+    )
+    response.raise_for_status()
+    places = response.json()
+    if not places:
+        return None
+    return float(places[0]["lat"]), float(places[0]["lon"])
+
+def fetch_map_elements(query):
+    for endpoint in OVERPASS_SERVERS:
+        try:
+            response = HTTP.post(
+                endpoint, data={"data": query},
+                headers={"User-Agent": "AutoForgeAI/0.2 (business discovery app)"},
+                timeout=(10, 45),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or "elements" not in payload:
+                raise ValueError("Unexpected response from map provider")
+            return payload["elements"]
+        except (requests.RequestException, ValueError):
+            app.logger.warning("Map provider failed: %s", endpoint, exc_info=True)
+    raise requests.RequestException("All map search providers are temporarily unavailable")
+
 @app.route("/")
 def home():
     with db() as c:
@@ -83,26 +133,19 @@ def discover():
         flash("Enter an area to search.", "error")
         return redirect(url_for("home"))
     try:
-        g = requests.get("https://nominatim.openstreetmap.org/search",
-            params={"q": area, "format": "jsonv2", "limit": 1},
-            headers={"User-Agent": "AutoForgeAI/0.1"}, timeout=20)
-        g.raise_for_status()
-        places = g.json()
-        if not places:
-            flash("Area not found. Try a more specific name.", "error")
+        coordinates = find_coordinates(area)
+        if coordinates is None:
+            flash("Area not found. Try a more specific town, city or neighbourhood.", "error")
             return redirect(url_for("home"))
-        lat, lon = float(places[0]["lat"]), float(places[0]["lon"])
+        lat, lon = coordinates
         tag = "shop" if kind in ("shop", "store", "retail") else kind
-        q = f"""[out:json][timeout:25];(
+        q = f"""[out:json][timeout:35];(
           node(around:3000,{lat},{lon})[shop];
           way(around:3000,{lat},{lon})[shop];
           node(around:3000,{lat},{lon})[amenity={tag}];
           way(around:3000,{lat},{lon})[amenity={tag}];
         );out center tags;"""
-        r = requests.post("https://overpass-api.de/api/interpreter", data=q,
-            headers={"User-Agent": "AutoForgeAI/0.1"}, timeout=35)
-        r.raise_for_status()
-        items = r.json().get("elements", [])
+        items = fetch_map_elements(q)
         saved = 0
         with db() as c:
             for item in items:
@@ -124,7 +167,8 @@ def discover():
             c.commit()
         flash(f"Checked {len(items)} map records; saved {saved} new listings. Verify every result manually.", "success")
     except requests.RequestException:
-        flash("The map service is temporarily unavailable. Try again later.", "error")
+        app.logger.exception("Business discovery map request failed")
+        flash("Map search is temporarily busy. AutoForge AI tried its backup map servers. Please wait a minute and try again.", "error")
     except (ValueError, KeyError):
         flash("The map service returned unexpected data.", "error")
     return redirect(url_for("home"))
