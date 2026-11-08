@@ -4,7 +4,7 @@ from urllib.parse import quote
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, flash, redirect, render_template, request, session, url_for, abort
+from flask import Flask, flash, redirect, render_template, request, session, url_for, abort, jsonify
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "autoforge.db"))
@@ -123,6 +123,45 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("home"))
+
+
+@app.route("/discover/import", methods=["POST"])
+@admin
+def import_discovered():
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("elements", [])
+    if not isinstance(items, list) or len(items) > 500:
+        return jsonify({"error": "Invalid result list."}), 400
+    saved = 0
+    checked = len(items)
+    with db() as c:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tags = item.get("tags") or {}
+            name = str(tags.get("name") or "").strip()
+            if not name or tags.get("website") or tags.get("contact:website"):
+                continue
+            center = item.get("center") or {}
+            lat = item.get("lat", center.get("lat"))
+            lon = item.get("lon", center.get("lon"))
+            address = ", ".join(x for x in [
+                tags.get("addr:housenumber"), tags.get("addr:street"),
+                tags.get("addr:suburb"), tags.get("addr:city")
+            ] if x)
+            osm_type, osm_id = str(item.get("type", "unknown")), str(item.get("id", ""))
+            if not osm_id:
+                continue
+            cur = c.execute("""INSERT OR IGNORE INTO leads
+                (name,category,address,phone,email,lat,lon,osm_id)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (name, tags.get("shop", tags.get("amenity", "shop")), address,
+                 tags.get("phone", tags.get("contact:phone", "")),
+                 tags.get("email", tags.get("contact:email", "")),
+                 lat, lon, f"{osm_type}:{osm_id}"))
+            saved += max(cur.rowcount, 0)
+        c.commit()
+    return jsonify({"checked": checked, "saved": saved})
 
 @app.route("/discover", methods=["POST"])
 @admin
