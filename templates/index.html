@@ -2,8 +2,71 @@
 <header class="top"><a class="brand" href="/">⚡ AutoForge AI</a><nav>{% if logged_in %}<a href="/logout">Log out</a>{% else %}<a href="/login">Admin login</a>{% endif %}</nav></header>
 <main class="wrap"><section class="hero"><small>LOCAL BUSINESS WEBSITE AGENT</small><h1>Find shops. Build their digital storefront.</h1><p>Discover public business listings without a recorded website, prepare private website drafts and manage product catalogues.</p></section>
 {% with msgs=get_flashed_messages(with_categories=true) %}{% for cat,msg in msgs %}<div class="notice {{cat}}">{{msg}}</div>{% endfor %}{% endwith %}
-{% if logged_in %}<section class="panel"><small>STEP 1</small><h2>Discover local businesses</h2><form action="/discover" method="post" class="grid"><label>Town, city or neighbourhood<input name="area" placeholder="e.g. Connaught Place, New Delhi" required></label><label>Business type<select name="category"><option value="shop">Shops and stores</option><option value="restaurant">Restaurants</option><option value="cafe">Cafes</option></select></label><button class="btn">Find businesses</button></form><p class="muted">OpenStreetMap data is used. A missing website field does not prove a business has no website; verify manually.</p></section>
+{% if logged_in %}<section class="panel"><small>STEP 1</small><h2>Discover local businesses</h2><form id="discover-form" class="grid"><label>Town, city or neighbourhood<input name="area" placeholder="e.g. Connaught Place, New Delhi" required></label><label>Business type<select name="category"><option value="shop">Shops and stores</option><option value="restaurant">Restaurants</option><option value="cafe">Cafes</option></select></label><button class="btn" id="discover-button" type="submit">Find businesses</button></form><p id="discover-status" class="muted" role="status">Search runs from your browser, so it does not depend on Render server outbound network access. OpenStreetMap data is used; missing website tags must be verified manually.</p></section>
 <section class="panel"><small>STEP 2</small><h2>Business leads ({{leads|length}})</h2>{% if leads %}<div class="scroll"><table><tr><th>Business</th><th>Category</th><th>Contact</th><th>Actions</th></tr>{% for l in leads %}<tr><td><b>{{l.name}}</b><small>{{l.address or 'Address not listed'}}</small></td><td>{{l.category}}</td><td>{{l.phone or '—'}}<small>{{l.email or 'No public email'}}</small></td><td><a href="/lead/{{l.id}}/email">Email draft</a><form action="/lead/{{l.id}}/create" method="post"><button class="mini">Create site draft</button></form></td></tr>{% endfor %}</table></div>{% else %}<p class="muted">No leads yet. Search an area above.</p>{% endif %}</section>
 <section class="panel"><small>STEP 3</small><h2>Website drafts</h2><div class="cards">{% for s in shops %}<a class="card" href="/shop/{{s.id}}"><b>{{s.name}}</b><span>{{s.slug}}</span><small>{{'Published' if s.approved else 'Private draft'}}</small></a>{% else %}<p class="muted">Create a draft from a lead to begin.</p>{% endfor %}</div></section>
 {% else %}<section class="panel center"><h2>Admin workspace</h2><p>Sign in to discover businesses and prepare storefront drafts.</p><a class="btn" href="/login">Admin login</a></section>{% endif %}
-<footer>AutoForge AI · Prototype · Owner approval required before publication</footer></main></body></html>
+<footer>AutoForge AI · Prototype · Owner approval required before publication</footer></main>
+<script>
+(() => {
+  const form = document.getElementById("discover-form");
+  if (!form) return;
+  const button = document.getElementById("discover-button");
+  const status = document.getElementById("discover-status");
+  const endpoints = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter"
+  ];
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const area = form.elements.area.value.trim();
+    const category = form.elements.category.value;
+    if (!area) return;
+    button.disabled = true;
+    status.textContent = "Finding the area and searching OpenStreetMap…";
+    try {
+      const geoUrl = new URL("https://nominatim.openstreetmap.org/search");
+      geoUrl.search = new URLSearchParams({q: area, format: "jsonv2", limit: "1"});
+      const geoResponse = await fetch(geoUrl, {headers: {"Accept":"application/json"}});
+      if (!geoResponse.ok) throw new Error("The location lookup service is unavailable.");
+      const places = await geoResponse.json();
+      if (!places.length) throw new Error("Area not found. Try a more specific town, city or neighbourhood.");
+      const lat = Number(places[0].lat), lon = Number(places[0].lon);
+      const tag = ["shop","store","retail"].includes(category) ? "shop" : category;
+      const query = '[out:json][timeout:35];(node(around:3000,'+lat+','+lon+')[shop];way(around:3000,'+lat+','+lon+')[shop];node(around:3000,'+lat+','+lon+')[amenity='+tag+'];way(around:3000,'+lat+','+lon+')[amenity='+tag+'];);out center tags;';
+      let elements = null, lastError = null;
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8","Accept":"application/json"},
+            body: new URLSearchParams({data: query})
+          });
+          if (!response.ok) throw new Error("Map provider returned HTTP " + response.status);
+          const data = await response.json();
+          if (!Array.isArray(data.elements)) throw new Error("Unexpected map response.");
+          elements = data.elements;
+          break;
+        } catch (err) { lastError = err; }
+      }
+      if (!elements) throw new Error("Map search could not connect from this browser. " + (lastError ? lastError.message : ""));
+      status.textContent = "Found " + elements.length + " map records. Saving business leads…";
+      const savedResponse = await fetch("/discover/import", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","Accept":"application/json"},
+        credentials:"same-origin",
+        body:JSON.stringify({area, elements})
+      });
+      const result = await savedResponse.json();
+      if (!savedResponse.ok) throw new Error(result.error || "Could not save results.");
+      status.textContent = "Done! Checked " + result.checked + " map records and saved " + result.saved + " new listings. Refreshing…";
+      window.location.reload();
+    } catch (err) {
+      status.textContent = "Search failed: " + err.message + " Please retry in a moment.";
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script></body></html>
