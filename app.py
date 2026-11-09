@@ -281,10 +281,15 @@ def email_draft(lead_id):
     with db() as c:
         lead = c.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
     if not lead: abort(404)
-    subject = f"A website idea for {lead['name']}"
-    body = (f"Hello {lead['name']} team,\\n\\nI found your business listing in "
-        f"{lead['address'] or 'your area'} and wanted to offer a simple website where customers can view products and contact you.\\n\\n"
-        "I can prepare a no-obligation sample for you to review. Nothing will be published without your approval.\\n\\n"
+    subject = f"Could you share your product catalogue? - {lead['name']}"
+    body = (f"Hello {lead['name']} team,\\n\\n"
+        "I'm preparing a website draft to help customers discover your store and its products. "
+        "Would you be willing to share your current product catalogue?\\n\\n"
+        "If possible, please send: product names, short descriptions, prices, product photos or image links, "
+        "and any available sizes/variants. You can share a catalogue PDF, spreadsheet, or a link if that is easier.\\n\\n"
+        "Please also confirm that you own or are authorised to share the photos and product information, "
+        "and let me know how you would like customers to contact or order from you. "
+        "I will keep the website as a private draft and will not publish anything without your approval.\\n\\n"
         "If you are not interested, please ignore this message and I will not follow up.\\n\\nRegards")
     mailto = f"mailto:{quote(lead['email'])}?subject={quote(subject)}&body={quote(body)}" if lead["email"] else ""
     return render_template("email.html", lead=lead, subject=subject, body=body, mailto=mailto)
