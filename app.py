@@ -44,6 +44,9 @@ def init_db():
           recipient TEXT NOT NULL, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(leads)").fetchall()}
+        if "email_consent_at" not in columns:
+            c.execute("ALTER TABLE leads ADD COLUMN email_consent_at TIMESTAMP")
         c.commit()
 
 def admin(fn):
@@ -327,9 +330,12 @@ def email_draft(lead_id):
 def send_catalogue_email(lead_id):
     if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("email_csrf", "")):
         abort(400)
-    if request.form.get("confirm") != "yes":
-        flash("Tick the confirmation box before sending.", "error")
+    if request.form.get("confirm") != "yes" or request.form.get("consent_confirm") != "yes":
+        flash("Confirm that the business explicitly agreed to receive this email before sending.", "error")
         return redirect(url_for("email_draft", lead_id=lead_id))
+    with db() as c:
+        c.execute("UPDATE leads SET email_consent_at=CURRENT_TIMESTAMP WHERE id=?", (lead_id,))
+        c.commit()
     with db() as c:
         lead = c.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
         recent = c.execute(
