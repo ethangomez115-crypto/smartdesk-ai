@@ -130,8 +130,10 @@ def logout():
 def import_discovered():
     payload = request.get_json(silent=True) or {}
     items = payload.get("elements", [])
-    if not isinstance(items, list) or len(items) > 500:
-        return jsonify({"error": "Invalid result list."}), 400
+    if not isinstance(items, list):
+        return jsonify({"error": "The map response did not contain a valid list of results."}), 400
+    if len(items) > 5000:
+        return jsonify({"error": "Too many map results. Please search a smaller area."}), 413
     saved = 0
     checked = len(items)
     with db() as c:
