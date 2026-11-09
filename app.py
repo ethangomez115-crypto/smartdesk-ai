@@ -57,6 +57,23 @@ def admin(fn):
 def slugify(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48] or "local-shop"
 
+def whatsapp_link(phone, business_name):
+    digits = re.sub(r"\\D", "", phone or "")
+    if len(digits) == 10:
+        digits = "91" + digits
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = "91" + digits[1:]
+    if not 8 <= len(digits) <= 15:
+        return ""
+    message = (
+        f"Hello {business_name} team. I found your public business listing and wanted to ask "
+        "whether you would be interested in a simple website for your shop. "
+        "If you would like details, please let me know. If not, no problem—I won't follow up."
+    )
+    return "https://wa.me/" + digits + "?text=" + quote(message)
+
+app.jinja_env.filters["whatsapp_link"] = whatsapp_link
+
 # Retry temporary network failures and use alternate Overpass map servers.
 HTTP = requests.Session()
 _retry = Retry(
