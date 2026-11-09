@@ -1,4 +1,4 @@
-import os, re, sqlite3, smtplib, ssl, secrets
+import os, re, sqlite3, smtplib, ssl, secrets, hashlib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
@@ -468,7 +468,7 @@ def verify_order(order_id):
              order["email"], order["phone"], order["address"]))
         shop_id = cur.lastrowid
         raw_token = secrets.token_urlsafe(32)
-        token_hash = secrets.sha256(raw_token.encode()).hexdigest()
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         expires = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
         c.execute("""INSERT INTO owner_accounts(shop_id,email,setup_token_hash,setup_expires_at)
             VALUES(?,?,?,?)""", (shop_id, order["email"], token_hash, expires))
@@ -503,7 +503,7 @@ def verify_order(order_id):
 
 @app.route("/owner/setup/<token>", methods=["GET", "POST"])
 def owner_setup(token):
-    token_hash = secrets.sha256(token.encode()).hexdigest()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
     with db() as c:
         account = c.execute("SELECT * FROM owner_accounts WHERE setup_token_hash=?", (token_hash,)).fetchone()
         if not account: abort(404)
