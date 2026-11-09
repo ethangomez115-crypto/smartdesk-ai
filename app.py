@@ -500,7 +500,7 @@ def template_catalog_pdf():
         story.append(Paragraph("<b>Best for:</b> " + item["best_for"], styles["BodyText"]))
         story.append(Paragraph("<b>Function preview</b>", styles["Heading3"]))
         for feature in item["features"]:
-            story.append(Paragraph("• " + feature, styles["BodyText"]))
+            story.append(Paragraph("- " + feature, styles["BodyText"]))
         story.append(Spacer(1, 5*mm))
     story.append(Paragraph("Product images and text are added by the business owner. A website stays private until the owner approves publication.", styles["Italic"]))
     doc.build(story)
