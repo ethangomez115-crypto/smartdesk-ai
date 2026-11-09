@@ -436,7 +436,33 @@ def order():
                     VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (business, owner, email, phone, package, packages[package], upi_ref, tagline, description, address))
                 c.commit()
-            flash("Payment details submitted. Your order is pending manual verification; your website will not be published before your approval.", "success")
+            # Notify the administrator immediately; this is an order-submission alert,
+            # not proof that the FamPay payment has cleared.
+            try:
+                smtp_password = os.environ.get("SMTP_PASSWORD")
+                smtp_user = os.environ.get("SMTP_USER", "autoforge@zohomail.in")
+                notify_to = os.environ.get("ADMIN_NOTIFICATION_EMAIL", smtp_user)
+                if smtp_password and notify_to:
+                    notice = EmailMessage()
+                    notice["From"] = os.environ.get("MAIL_FROM", smtp_user)
+                    notice["To"] = notify_to
+                    notice["Subject"] = f"New AutoForge website order — {business}"
+                    notice.set_content(
+                        f"A new website order was submitted and needs manual FamPay verification.\\n\\n"
+                        f"Business: {business}\\nOwner: {owner}\\nCustomer email: {email}\\n"
+                        f"Phone: {phone or 'Not provided'}\\nPackage: {package}\\n"
+                        f"Amount claimed: INR {packages[package]}\\nUPI reference: {upi_ref}\\n\\n"
+                        f"Review the order in the admin dashboard: {request.url_root.rstrip('/')}/admin/orders\\n\\n"
+                        "Do not approve based only on this notification or a screenshot. Match the UTR against the actual FamPay transaction.")
+                    with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtppro.zoho.in"),
+                            int(os.environ.get("SMTP_PORT", "465")), context=ssl.create_default_context(), timeout=20) as smtp:
+                        smtp.login(smtp_user, smtp_password)
+                        smtp.send_message(notice)
+                else:
+                    app.logger.warning("Order %s saved; admin email alert skipped because SMTP_PASSWORD or ADMIN_NOTIFICATION_EMAIL is missing", upi_ref)
+            except Exception:
+                app.logger.exception("Order %s saved but admin notification email failed", upi_ref)
+            flash("Order submitted. AutoForge has notified the administrator by email when SMTP is configured. Payment still needs manual FamPay verification.", "success")
             return redirect(url_for("order"))
         except sqlite3.IntegrityError:
             flash("That transaction reference has already been submitted. Please check it or contact support.", "error")
