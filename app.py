@@ -1,4 +1,6 @@
-import os, re, sqlite3
+import os, re, sqlite3, smtplib, ssl, secrets
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from functools import wraps
 from urllib.parse import quote
 import requests
@@ -36,6 +38,10 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER NOT NULL,
           name TEXT NOT NULL, description TEXT DEFAULT '', price TEXT DEFAULT '',
           image_url TEXT DEFAULT '', FOREIGN KEY(shop_id) REFERENCES shops(id)
+        );
+        CREATE TABLE IF NOT EXISTS email_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, lead_id INTEGER NOT NULL,
+          recipient TEXT NOT NULL, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
         c.commit()
@@ -280,19 +286,93 @@ def publish(shop_id):
 def email_draft(lead_id):
     with db() as c:
         lead = c.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+        recent = c.execute(
+            "SELECT sent_at FROM email_log WHERE lead_id=? ORDER BY id DESC LIMIT 1",
+            (lead_id,)
+        ).fetchone()
     if not lead: abort(404)
     subject = f"Could you share your product catalogue? - {lead['name']}"
-    body = (f"Hello {lead['name']} team,\\n\\n"
-        "I'm preparing a website draft to help customers discover your store and its products. "
-        "Would you be willing to share your current product catalogue?\\n\\n"
-        "If possible, please send: product names, short descriptions, prices, product photos or image links, "
-        "and any available sizes/variants. You can share a catalogue PDF, spreadsheet, or a link if that is easier.\\n\\n"
-        "Please also confirm that you own or are authorised to share the photos and product information, "
-        "and let me know how you would like customers to contact or order from you. "
-        "I will keep the website as a private draft and will not publish anything without your approval.\\n\\n"
-        "If you are not interested, please ignore this message and I will not follow up.\\n\\nRegards")
-    mailto = f"mailto:{quote(lead['email'])}?subject={quote(subject)}&body={quote(body)}" if lead["email"] else ""
-    return render_template("email.html", lead=lead, subject=subject, body=body, mailto=mailto)
+    body = (f"Hello {lead['name']} team,\n\n"
+        "I'm preparing a private website draft to help customers discover your store. "
+        "Would you be willing to share your current product catalogue?\n\n"
+        "If convenient, please share product names, descriptions, prices, photos or image links, "
+        "and any sizes or variants. A PDF, spreadsheet, or catalogue link is fine.\n\n"
+        "Please confirm that you own or are authorised to share the information and images, "
+        "and tell me how customers should contact or order from you. "
+        "Nothing will be published without your approval.\n\n"
+        "If you are not interested, reply and I will not contact you again.\n\nRegards,\nAutoForge AI")
+    token = session.setdefault("email_csrf", secrets.token_urlsafe(32))
+    return render_template("email.html", lead=lead, subject=subject, body=body,
+                           csrf_token=token, recent=recent)
+
+@app.route("/lead/<int:lead_id>/email/send", methods=["POST"])
+@admin
+def send_catalogue_email(lead_id):
+    if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("email_csrf", "")):
+        abort(400)
+    if request.form.get("confirm") != "yes":
+        flash("Tick the confirmation box before sending.", "error")
+        return redirect(url_for("email_draft", lead_id=lead_id))
+    with db() as c:
+        lead = c.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+        recent = c.execute(
+            "SELECT sent_at FROM email_log WHERE lead_id=? ORDER BY id DESC LIMIT 1",
+            (lead_id,)
+        ).fetchone()
+    if not lead: abort(404)
+    if not lead["email"]:
+        flash("No public email address is listed for this business.", "error")
+        return redirect(url_for("email_draft", lead_id=lead_id))
+    if recent:
+        try:
+            last_sent = datetime.fromisoformat(str(recent["sent_at"]).replace("Z", "+00:00"))
+            if last_sent.tzinfo is None:
+                last_sent = last_sent.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - last_sent < timedelta(days=30):
+                flash("A request was already sent to this lead within the last 30 days.", "error")
+                return redirect(url_for("email_draft", lead_id=lead_id))
+        except ValueError:
+            flash("Could not verify the previous send date; blocking a duplicate for safety.", "error")
+            return redirect(url_for("email_draft", lead_id=lead_id))
+
+    host = os.environ.get("SMTP_HOST", "smtppro.zoho.in")
+    port = int(os.environ.get("SMTP_PORT", "465"))
+    username = os.environ.get("SMTP_USER", "autoforge@zohomail.in")
+    password = os.environ.get("SMTP_PASSWORD")
+    sender = os.environ.get("MAIL_FROM", username)
+    if not password:
+        flash("Zoho is not configured yet. Add SMTP_PASSWORD in Render Environment first.", "error")
+        return redirect(url_for("email_draft", lead_id=lead_id))
+
+    subject = f"Could you share your product catalogue? - {lead['name']}"
+    body = (f"Hello {lead['name']} team,\n\n"
+        "I'm preparing a private website draft to help customers discover your store. "
+        "Would you be willing to share your current product catalogue?\n\n"
+        "If convenient, please share product names, descriptions, prices, photos or image links, "
+        "and any sizes or variants. A PDF, spreadsheet, or catalogue link is fine.\n\n"
+        "Please confirm that you own or are authorised to share the information and images, "
+        "and tell me how customers should contact or order from you. "
+        "Nothing will be published without your approval.\n\n"
+        "If you are not interested, reply and I will not contact you again.\n\nRegards,\nAutoForge AI")
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = lead["email"]
+    message["Subject"] = subject
+    message.set_content(body)
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=20) as smtp:
+            smtp.login(username, password)
+            smtp.send_message(message)
+        with db() as c:
+            c.execute("INSERT INTO email_log(lead_id,recipient) VALUES(?,?)",
+                      (lead_id, lead["email"]))
+            c.commit()
+        flash(f"Email sent to {lead['email']}. No automatic follow-up will be sent.", "success")
+    except Exception:
+        app.logger.exception("Zoho SMTP send failed for lead %s", lead_id)
+        flash("Zoho could not send the email. Check SMTP_HOST, SMTP_PORT and SMTP credentials in Render; no password is shown here.", "error")
+    return redirect(url_for("email_draft", lead_id=lead_id))
 
 @app.errorhandler(404)
 def missing(_):
