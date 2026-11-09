@@ -1,6 +1,11 @@
 import os, re, sqlite3, smtplib, ssl, secrets, hashlib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
 from functools import wraps
 from urllib.parse import quote
 import requests
@@ -45,7 +50,7 @@ def init_db():
           owner_name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
           package TEXT NOT NULL, amount INTEGER NOT NULL, upi_ref TEXT NOT NULL UNIQUE,
           tagline TEXT DEFAULT '', description TEXT DEFAULT '', address TEXT DEFAULT '',
-          status TEXT DEFAULT 'pending', shop_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          template_key TEXT DEFAULT 'modern', status TEXT DEFAULT 'pending', shop_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS owner_accounts (
           id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER UNIQUE NOT NULL,
@@ -61,6 +66,12 @@ def init_db():
         columns = {row["name"] for row in c.execute("PRAGMA table_info(leads)").fetchall()}
         if "email_consent_at" not in columns:
             c.execute("ALTER TABLE leads ADD COLUMN email_consent_at TIMESTAMP")
+        shop_columns = {row["name"] for row in c.execute("PRAGMA table_info(shops)").fetchall()}
+        if "template_key" not in shop_columns:
+            c.execute("ALTER TABLE shops ADD COLUMN template_key TEXT DEFAULT 'modern'")
+        order_columns = {row["name"] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
+        if "template_key" not in order_columns:
+            c.execute("ALTER TABLE orders ADD COLUMN template_key TEXT DEFAULT 'modern'")
         c.commit()
 
 def admin(fn):
@@ -90,6 +101,13 @@ def whatsapp_link(phone, business_name):
     return "https://wa.me/" + digits + "?text=" + quote(message)
 
 app.jinja_env.filters["whatsapp_link"] = whatsapp_link
+
+SITE_TEMPLATES = {
+    "modern": {"name": "Modern Store", "tagline": "Clean, modern business website", "features": ["Large hero section", "Product cards with images and prices", "Business details and contact buttons", "Mobile-friendly layout"], "best_for": "Retail shops, boutiques and local businesses"},
+    "classic": {"name": "Classic Business", "tagline": "Trust-focused traditional layout", "features": ["Business introduction first", "Clear address and contact details", "Simple product/service list", "Easy-to-read sections"], "best_for": "Repair shops, clinics, studios and service providers"},
+    "catalog": {"name": "Product Catalogue", "tagline": "Put products front and centre", "features": ["Product-first grid", "Image, description and price per item", "Contact the shop by email", "Designed for larger catalogues"], "best_for": "Clothing, accessories, grocery and product sellers"},
+    "minimal": {"name": "Minimal Portfolio", "tagline": "Simple, elegant and lightweight", "features": ["Minimal header and clean typography", "Short business story", "Featured products or services", "Fast, uncluttered mobile experience"], "best_for": "Freelancers, creators and small service businesses"},
+}
 
 # Retry temporary network failures and use alternate Overpass map servers.
 HTTP = requests.Session()
@@ -423,18 +441,19 @@ def order():
         email = request.form.get("email", "").strip().lower()
         phone = request.form.get("phone", "").strip()
         package = request.form.get("package", "")
+        template_key = request.form.get("template_key", "modern")
         upi_ref = re.sub(r"[^A-Za-z0-9]", "", request.form.get("upi_ref", "").strip())
         tagline = request.form.get("tagline", "").strip()
         description = request.form.get("description", "").strip()
         address = request.form.get("address", "").strip()
-        if not all([business, owner, email, package, upi_ref]) or package not in packages or len(upi_ref) < 8:
+        if not all([business, owner, email, package, upi_ref]) or package not in packages or template_key not in SITE_TEMPLATES or len(upi_ref) < 8:
             flash("Please complete all required fields and enter a valid UPI transaction reference.", "error")
             return redirect(url_for("order"))
         try:
             with db() as c:
-                c.execute("""INSERT INTO orders(business_name,owner_name,email,phone,package,amount,upi_ref,tagline,description,address)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (business, owner, email, phone, package, packages[package], upi_ref, tagline, description, address))
+                c.execute("""INSERT INTO orders(business_name,owner_name,email,phone,package,amount,upi_ref,tagline,description,address,template_key)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (business, owner, email, phone, package, packages[package], upi_ref, tagline, description, address, template_key))
                 c.commit()
             # Notify the administrator immediately; this is an order-submission alert,
             # not proof that the FamPay payment has cleared.
@@ -450,7 +469,7 @@ def order():
                     notice.set_content(
                         f"A new website order was submitted and needs manual FamPay verification.\\n\\n"
                         f"Business: {business}\\nOwner: {owner}\\nCustomer email: {email}\\n"
-                        f"Phone: {phone or 'Not provided'}\\nPackage: {package}\\n"
+                        f"Phone: {phone or 'Not provided'}\\nPackage: {package}\\nTemplate: {SITE_TEMPLATES[template_key]['name']}\\n"
                         f"Amount claimed: INR {packages[package]}\\nUPI reference: {upi_ref}\\n\\n"
                         f"Review the order in the admin dashboard: {request.url_root.rstrip('/')}/admin/orders\\n\\n"
                         "Do not approve based only on this notification or a screenshot. Match the UTR against the actual FamPay transaction.")
@@ -466,7 +485,28 @@ def order():
             return redirect(url_for("order"))
         except sqlite3.IntegrityError:
             flash("That transaction reference has already been submitted. Please check it or contact support.", "error")
-    return render_template("order.html", packages=packages, upi_id=upi_id, payee=payee)
+    return render_template("order.html", packages=packages, upi_id=upi_id, payee=payee, templates=SITE_TEMPLATES)
+
+@app.route("/templates.pdf")
+def template_catalog_pdf():
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("AutoForge AI — Website Template Catalogue", styles["Title"]),
+             Paragraph("Choose a website style when placing your order. The previews describe the layout and included functions.", styles["BodyText"]), Spacer(1, 8*mm)]
+    for item in SITE_TEMPLATES.values():
+        story.append(Paragraph(item["name"], styles["Heading2"]))
+        story.append(Paragraph(item["tagline"], styles["BodyText"]))
+        story.append(Paragraph("<b>Best for:</b> " + item["best_for"], styles["BodyText"]))
+        story.append(Paragraph("<b>Function preview</b>", styles["Heading3"]))
+        for feature in item["features"]:
+            story.append(Paragraph("• " + feature, styles["BodyText"]))
+        story.append(Spacer(1, 5*mm))
+    story.append(Paragraph("Product images and text are added by the business owner. A website stays private until the owner approves publication.", styles["Italic"]))
+    doc.build(story)
+    buffer.seek(0)
+    from flask import send_file
+    return send_file(buffer, mimetype="application/pdf", as_attachment=True, download_name="AutoForge-Website-Templates.pdf")
 
 @app.route("/admin/orders")
 @admin
@@ -488,10 +528,10 @@ def verify_order(order_id):
         slug, n = base, 2
         while c.execute("SELECT 1 FROM shops WHERE slug=?", (slug,)).fetchone():
             slug, n = f"{base}-{n}", n + 1
-        cur = c.execute("""INSERT INTO shops(slug,name,tagline,description,email,phone,address,approved)
-            VALUES(?,?,?,?,?,?,?,0)""",
+        cur = c.execute("""INSERT INTO shops(slug,name,tagline,description,email,phone,address,approved,template_key)
+            VALUES(?,?,?,?,?,?,?,0,?)""",
             (slug, order["business_name"], order["tagline"], order["description"],
-             order["email"], order["phone"], order["address"]))
+             order["email"], order["phone"], order["address"], order["template_key"]))
         shop_id = cur.lastrowid
         raw_token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
