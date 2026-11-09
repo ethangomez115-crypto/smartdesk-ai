@@ -4,6 +4,7 @@ from email.message import EmailMessage
 from functools import wraps
 from urllib.parse import quote
 import requests
+from werkzeug.security import generate_password_hash, check_password_hash
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, flash, redirect, render_template, request, session, url_for, abort, jsonify
@@ -38,6 +39,19 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER NOT NULL,
           name TEXT NOT NULL, description TEXT DEFAULT '', price TEXT DEFAULT '',
           image_url TEXT DEFAULT '', FOREIGN KEY(shop_id) REFERENCES shops(id)
+        );
+        CREATE TABLE IF NOT EXISTS orders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, business_name TEXT NOT NULL,
+          owner_name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
+          package TEXT NOT NULL, amount INTEGER NOT NULL, upi_ref TEXT NOT NULL UNIQUE,
+          tagline TEXT DEFAULT '', description TEXT DEFAULT '', address TEXT DEFAULT '',
+          status TEXT DEFAULT 'pending', shop_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS owner_accounts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER UNIQUE NOT NULL,
+          email TEXT NOT NULL UNIQUE, password_hash TEXT,
+          setup_token_hash TEXT, setup_expires_at TIMESTAMP,
+          FOREIGN KEY(shop_id) REFERENCES shops(id)
         );
         CREATE TABLE IF NOT EXISTS email_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, lead_id INTEGER NOT NULL,
@@ -396,6 +410,185 @@ def send_catalogue_email(lead_id):
         app.logger.exception("Zoho SMTP send failed for lead %s", lead_id)
         flash("Zoho could not send the email. Check SMTP_HOST, SMTP_PORT and SMTP credentials in Render; no password is shown here.", "error")
     return redirect(url_for("email_draft", lead_id=lead_id))
+
+
+@app.route("/order", methods=["GET", "POST"])
+def order():
+    packages = {"Starter Website": 999, "Business Website": 1999, "Store Website": 2999}
+    upi_id = os.environ.get("FAMPAY_UPI_ID", "")
+    payee = os.environ.get("FAMPAY_PAYEE_NAME", "AutoForge AI")
+    if request.method == "POST":
+        business = request.form.get("business_name", "").strip()
+        owner = request.form.get("owner_name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        phone = request.form.get("phone", "").strip()
+        package = request.form.get("package", "")
+        upi_ref = re.sub(r"[^A-Za-z0-9]", "", request.form.get("upi_ref", "").strip())
+        tagline = request.form.get("tagline", "").strip()
+        description = request.form.get("description", "").strip()
+        address = request.form.get("address", "").strip()
+        if not all([business, owner, email, package, upi_ref]) or package not in packages or len(upi_ref) < 8:
+            flash("Please complete all required fields and enter a valid UPI transaction reference.", "error")
+            return redirect(url_for("order"))
+        try:
+            with db() as c:
+                c.execute("""INSERT INTO orders(business_name,owner_name,email,phone,package,amount,upi_ref,tagline,description,address)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (business, owner, email, phone, package, packages[package], upi_ref, tagline, description, address))
+                c.commit()
+            flash("Payment details submitted. Your order is pending manual verification; your website will not be published before your approval.", "success")
+            return redirect(url_for("order"))
+        except sqlite3.IntegrityError:
+            flash("That transaction reference has already been submitted. Please check it or contact support.", "error")
+    return render_template("order.html", packages=packages, upi_id=upi_id, payee=payee)
+
+@app.route("/admin/orders")
+@admin
+def admin_orders():
+    with db() as c:
+        orders = c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 200").fetchall()
+    return render_template("orders.html", orders=orders)
+
+@app.route("/admin/orders/<int:order_id>/verify", methods=["POST"])
+@admin
+def verify_order(order_id):
+    with db() as c:
+        order = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not order: abort(404)
+        if order["status"] != "pending":
+            flash("This order has already been processed.", "error")
+            return redirect(url_for("admin_orders"))
+        base = slugify(order["business_name"])
+        slug, n = base, 2
+        while c.execute("SELECT 1 FROM shops WHERE slug=?", (slug,)).fetchone():
+            slug, n = f"{base}-{n}", n + 1
+        cur = c.execute("""INSERT INTO shops(slug,name,tagline,description,email,phone,address,approved)
+            VALUES(?,?,?,?,?,?,?,0)""",
+            (slug, order["business_name"], order["tagline"], order["description"],
+             order["email"], order["phone"], order["address"]))
+        shop_id = cur.lastrowid
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = secrets.sha256(raw_token.encode()).hexdigest()
+        expires = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+        c.execute("""INSERT INTO owner_accounts(shop_id,email,setup_token_hash,setup_expires_at)
+            VALUES(?,?,?,?)""", (shop_id, order["email"], token_hash, expires))
+        c.execute("UPDATE orders SET status='verified',shop_id=? WHERE id=?", (shop_id, order_id))
+        c.commit()
+    host = os.environ.get("PUBLIC_BASE_URL", request.url_root.rstrip("/"))
+    setup_url = host + url_for("owner_setup", token=raw_token)
+    password = os.environ.get("SMTP_PASSWORD")
+    if password:
+        try:
+            msg = EmailMessage()
+            msg["From"] = os.environ.get("MAIL_FROM", os.environ.get("SMTP_USER", "autoforge@zohomail.in"))
+            msg["To"] = order["email"]
+            msg["Subject"] = "Your AutoForge AI website workspace is ready"
+            msg.set_content(
+                f"Hello {order['owner_name']},\n\nYour payment for {order['package']} has been verified. "
+                f"We created a private website draft for {order['business_name']}.\n\n"
+                f"Set your owner password using this one-time link (expires in 48 hours):\n{setup_url}\n\n"
+                "After setting your password, you can review your details and products in your owner workspace. "
+                "Your website remains private until you choose to publish it.\n\nAutoForge AI")
+            with smtplib.SMTP_SSL(os.environ.get("SMTP_HOST", "smtppro.zoho.in"),
+                    int(os.environ.get("SMTP_PORT", "465")), context=ssl.create_default_context(), timeout=20) as smtp:
+                smtp.login(os.environ.get("SMTP_USER", "autoforge@zohomail.in"), password)
+                smtp.send_message(msg)
+            flash("Payment marked verified, private website draft created, and secure setup link emailed.", "success")
+        except Exception:
+            app.logger.exception("Owner setup email failed for order %s", order_id)
+            flash("Payment verified and draft created, but setup email failed. Check Zoho SMTP settings before resending.", "error")
+    else:
+        flash("Payment verified and draft created, but SMTP_PASSWORD is missing; setup email was not sent.", "error")
+    return redirect(url_for("admin_orders"))
+
+@app.route("/owner/setup/<token>", methods=["GET", "POST"])
+def owner_setup(token):
+    token_hash = secrets.sha256(token.encode()).hexdigest()
+    with db() as c:
+        account = c.execute("SELECT * FROM owner_accounts WHERE setup_token_hash=?", (token_hash,)).fetchone()
+        if not account: abort(404)
+        try:
+            expires = datetime.fromisoformat(account["setup_expires_at"])
+            if expires.tzinfo is None: expires = expires.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError): abort(404)
+        if expires < datetime.now(timezone.utc): abort(404)
+        if request.method == "POST":
+            pw = request.form.get("password", "")
+            if len(pw) < 12:
+                flash("Use a password with at least 12 characters.", "error")
+            else:
+                c.execute("UPDATE owner_accounts SET password_hash=?,setup_token_hash=NULL,setup_expires_at=NULL WHERE id=?",
+                    (generate_password_hash(pw), account["id"]))
+                c.commit()
+                session.clear()
+                session["owner_shop_id"] = account["shop_id"]
+                return redirect(url_for("owner_portal"))
+    return render_template("owner_setup.html")
+
+@app.route("/owner")
+def owner_portal():
+    shop_id = session.get("owner_shop_id")
+    if not shop_id: return redirect(url_for("owner_login"))
+    with db() as c:
+        shop = c.execute("SELECT * FROM shops WHERE id=?", (shop_id,)).fetchone()
+        products = c.execute("SELECT * FROM products WHERE shop_id=? ORDER BY id DESC", (shop_id,)).fetchall()
+    if not shop: abort(404)
+    return render_template("owner_portal.html", shop=shop, products=products)
+
+@app.route("/owner/login", methods=["GET", "POST"])
+def owner_login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        with db() as c:
+            account = c.execute("SELECT * FROM owner_accounts WHERE email=?", (email,)).fetchone()
+        if account and account["password_hash"] and check_password_hash(account["password_hash"], request.form.get("password", "")):
+            session.clear()
+            session["owner_shop_id"] = account["shop_id"]
+            return redirect(url_for("owner_portal"))
+        flash("Email or password is incorrect.", "error")
+    return render_template("owner_login.html")
+
+@app.route("/owner/save", methods=["POST"])
+def owner_save():
+    shop_id = session.get("owner_shop_id")
+    if not shop_id: return redirect(url_for("owner_login"))
+    with db() as c:
+        c.execute("UPDATE shops SET tagline=?,description=?,email=?,phone=?,address=? WHERE id=?",
+            (request.form.get("tagline",""),request.form.get("description",""),request.form.get("email",""),
+             request.form.get("phone",""),request.form.get("address",""),shop_id))
+        c.commit()
+    flash("Your website details have been saved.", "success")
+    return redirect(url_for("owner_portal"))
+
+@app.route("/owner/product", methods=["POST"])
+def owner_product():
+    shop_id = session.get("owner_shop_id")
+    if not shop_id: return redirect(url_for("owner_login"))
+    name = request.form.get("name","").strip()
+    if not name:
+        flash("Product name is required.", "error")
+        return redirect(url_for("owner_portal"))
+    with db() as c:
+        c.execute("INSERT INTO products(shop_id,name,description,price,image_url) VALUES(?,?,?,?,?)",
+            (shop_id,name,request.form.get("description",""),request.form.get("price",""),request.form.get("image_url","")))
+        c.commit()
+    return redirect(url_for("owner_portal"))
+
+@app.route("/owner/publish", methods=["POST"])
+def owner_publish():
+    shop_id = session.get("owner_shop_id")
+    if not shop_id: return redirect(url_for("owner_login"))
+    with db() as c:
+        c.execute("UPDATE shops SET approved=1 WHERE id=?", (shop_id,))
+        c.commit()
+        shop = c.execute("SELECT slug FROM shops WHERE id=?", (shop_id,)).fetchone()
+    flash("Your storefront is now published.", "success")
+    return redirect(url_for("owner_portal"))
+
+@app.route("/owner/logout")
+def owner_logout():
+    session.pop("owner_shop_id", None)
+    return redirect(url_for("owner_login"))
 
 @app.errorhandler(404)
 def missing(_):
